@@ -2,7 +2,7 @@ import asyncio
 import logging
 import os
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 
 import discord
@@ -27,6 +27,7 @@ class GuildTTSState:
     queue: asyncio.Queue
     voice_client: Optional[discord.VoiceClient] = None
     worker: Optional[asyncio.Task] = None
+    last_speaker_by_channel: dict[int, int] = field(default_factory=dict)
 
 
 class TTSManager:
@@ -213,7 +214,12 @@ def build_bot() -> commands.Bot:
         if len(content) > MAX_MESSAGE_CHARS:
             content = content[: MAX_MESSAGE_CHARS - 1] + "…"
 
-        text = f"{message.author.display_name} says: {content}"
+        last_speaker = state.last_speaker_by_channel.get(message.channel.id)
+        if last_speaker == message.author.id:
+            text = content
+        else:
+            text = f"{message.author.display_name} says: {content}"
+            state.last_speaker_by_channel[message.channel.id] = message.author.id
         logger.debug("Queueing message from %s in guild %s.", message.author.display_name, message.guild.id)
         await tts_manager.enqueue(message.guild.id, text)
         await bot.process_commands(message)
