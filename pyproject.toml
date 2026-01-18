@@ -1,0 +1,20 @@
+[project]
+name = "dtts"
+version = "0.1.0"
+description = "Discord TTS bot using Pocket TTS"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "discord.py>=2.4.0",
+  "pocket-tts>=0.1.0",
+  "python-dotenv>=1.0.1",
+  "PyNaCl>=1.5.0",
+  "scipy>=1.12.0",
+  "torch>=2.5.0",
+]
+
+[project.scripts]
+dtts = "dtts_bot:main"
+
+[tool.uv]
+dev-dependencies = []
