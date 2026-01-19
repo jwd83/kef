@@ -33,3 +33,7 @@ uv run dtts
 ## Commands
 - `!join` — join the caller’s voice channel and start reading all server messages.
 - `!leave` — leave the voice channel.
+- `!voice` — list available `.wav` voices in `voices/` and show usage.
+- `!voice list` — list built-in voices and local `.wav` voices in `voices/`.
+- `!voice <name>` — switch to a built-in voice or `voices/<name>.wav` if present.
+- `!voice default` — reset to the default voice prompt.

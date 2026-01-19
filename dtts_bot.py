@@ -1,8 +1,10 @@
 import asyncio
 import logging
 import os
+import re
 import tempfile
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Optional
 
 import discord
@@ -13,6 +15,17 @@ from scipy.io.wavfile import write as write_wav
 
 
 VOICE_PROMPT_DEFAULT = "alba"
+BUILTIN_VOICES = [
+    "alba",
+    "marius",
+    "javert",
+    "jean",
+    "fantine",
+    "cosette",
+    "eponine",
+    "azelma",
+]
+VOICES_DIR = Path(__file__).resolve().parent / "voices"
 MAX_QUEUE_SIZE = 100
 MAX_MESSAGE_CHARS = 220
 
@@ -20,6 +33,7 @@ MAX_MESSAGE_CHARS = 220
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(level=LOG_LEVEL, format="%(levelname)s:%(name)s:%(message)s")
 logger = logging.getLogger("dtts")
+URL_RE = re.compile(r"(?i)\b(?:https?://|www\.|discord\.gg/|discord\.com/invite/)\S+")
 
 
 @dataclass
@@ -35,6 +49,11 @@ class TTSManager:
         self.bot = bot
         self._model: Optional[TTSModel] = None
         self._voice_state = None
+        self._voice_prompt = (
+            os.getenv("POCKET_TTS_VOICE")
+            or os.getenv("POCKET_TTS_VOICE_PROMPT")
+            or VOICE_PROMPT_DEFAULT
+        )
         self._guilds: dict[int, GuildTTSState] = {}
 
     async def ensure_model(self) -> None:
@@ -43,21 +62,17 @@ class TTSManager:
             return
         logger.info("Loading Pocket TTS model...")
         self._model = TTSModel.load_model()
-        voice_prompt = (
-            os.getenv("POCKET_TTS_VOICE")
-            or os.getenv("POCKET_TTS_VOICE_PROMPT")
-            or VOICE_PROMPT_DEFAULT
-        )
-        logger.info("Using voice prompt: %s", voice_prompt)
+        logger.info("Using voice prompt: %s", self._voice_prompt)
         try:
-            self._voice_state = self._model.get_state_for_audio_prompt(voice_prompt)
+            self._voice_state = self._model.get_state_for_audio_prompt(self._voice_prompt)
         except ValueError as exc:
-            if "voice cloning" in str(exc).lower() and voice_prompt != VOICE_PROMPT_DEFAULT:
+            if "voice cloning" in str(exc).lower() and self._voice_prompt != VOICE_PROMPT_DEFAULT:
                 logger.warning(
                     "Voice prompt requires voice cloning; falling back to '%s'.",
                     VOICE_PROMPT_DEFAULT,
                 )
-                self._voice_state = self._model.get_state_for_audio_prompt(VOICE_PROMPT_DEFAULT)
+                self._voice_prompt = VOICE_PROMPT_DEFAULT
+                self._voice_state = self._model.get_state_for_audio_prompt(self._voice_prompt)
             else:
                 raise
         logger.info("Pocket TTS model loaded.")
@@ -95,6 +110,13 @@ class TTSManager:
         os.close(fd)
         write_wav(path, sample_rate, audio)
         return path
+
+    async def set_voice_prompt(self, voice_prompt: str) -> None:
+        await self.ensure_model()
+        assert self._model is not None
+        self._voice_prompt = voice_prompt
+        self._voice_state = self._model.get_state_for_audio_prompt(self._voice_prompt)
+        logger.info("Updated voice prompt to: %s", self._voice_prompt)
 
     async def play_wav(self, voice_client: discord.VoiceClient, path: str) -> None:
         done = asyncio.Event()
@@ -192,6 +214,67 @@ def build_bot() -> commands.Bot:
             logger.info("Disconnected voice client (guild %s).", ctx.guild.id)
             await ctx.send("Left the voice channel.")
 
+    def _sanitize_tts_text(message: discord.Message) -> str:
+        content = message.clean_content.strip()
+        if not content:
+            return ""
+        content = URL_RE.sub("link", content)
+        return discord.utils.escape_mentions(content)
+
+    def _available_voices() -> list[str]:
+        if not VOICES_DIR.exists():
+            return []
+        return sorted(path.stem for path in VOICES_DIR.glob("*.wav"))
+
+    def _resolve_voice_prompt(name: str) -> tuple[str, str]:
+        if name == "default":
+            return VOICE_PROMPT_DEFAULT, "default"
+        if not VOICES_DIR.exists():
+            return name, "builtin"
+        for path in VOICES_DIR.glob("*.wav"):
+            if path.stem.lower() == name:
+                return str(path), "local"
+        return name, "builtin"
+
+    @bot.command(name="voice")
+    async def set_voice(ctx: commands.Context, *, voice_name: Optional[str] = None) -> None:
+        if voice_name is None or voice_name.strip().lower() == "list":
+            voices = _available_voices()
+            builtins = ", ".join(BUILTIN_VOICES)
+            local = ", ".join(voices) if voices else "none"
+            await ctx.send(
+                "Built-in voices: "
+                + builtins
+                + ". Local voices: "
+                + local
+                + ". Use `!voice <name>` or `!voice default`."
+            )
+            return
+
+        voice_key = voice_name.strip().lower()
+        prompt, source = _resolve_voice_prompt(voice_key)
+
+        try:
+            await tts_manager.set_voice_prompt(prompt)
+        except ValueError as exc:
+            if source == "local" and "voice cloning" in str(exc).lower():
+                await ctx.send("That voice requires cloning access. Try `!voice default`.")
+                return
+            if source == "builtin":
+                await ctx.send(
+                    "Unknown built-in voice or not available. "
+                    "Use `!voice` to list local voices or `!voice default`."
+                )
+                return
+            raise
+
+        if prompt == VOICE_PROMPT_DEFAULT:
+            await ctx.send("Voice reset to default.")
+        elif source == "builtin":
+            await ctx.send(f"Voice set to built-in '{voice_key}'.")
+        else:
+            await ctx.send(f"Voice set to '{voice_key}'.")
+
     @bot.event
     async def on_message(message: discord.Message) -> None:
         if message.author.bot or not message.guild:
@@ -206,7 +289,7 @@ def build_bot() -> commands.Bot:
             await bot.process_commands(message)
             return
 
-        content = discord.utils.escape_mentions(message.content.strip())
+        content = _sanitize_tts_text(message)
         if not content:
             await bot.process_commands(message)
             return
