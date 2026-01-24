@@ -9,3 +9,5 @@ the main features to add:
 2. !open command takes either an "m number" or a raw magnet link uses our alldebrid api key, attempts to unlock it, and reports back the status. if it is able to be unlocked reply with all videos numbered
 
 3. !play command takes the same parameter types as the !open command as well as an additional parameter that is a number. the play command will play the video file in VLC from the numbered videos within the magnet link that was viewed with an !open command. if a number is omitted the first listed file is played.
+
+my .env file has been updated to include ALLDEBRID_API_KEY 
