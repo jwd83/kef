@@ -1,0 +1,49 @@
+appId: com.watchy.app
+productName: watchy
+directories:
+  buildResources: build
+files:
+  - '!**/.vscode/*'
+  - '!src/*'
+  - '!electron.vite.config.{js,ts,mjs,cjs}'
+  - '!{.eslintcache,eslint.config.mjs,.prettierignore,.prettierrc.yaml,dev-app-update.yml,CHANGELOG.md,README.md}'
+  - '!{.env,.env.*,.npmrc,pnpm-lock.yaml}'
+extraResources:
+  - from: build/icon.ico
+    to: icon.ico
+  - from: build/icon.png
+    to: icon.png
+  - from: media_catalog.db
+    to: media_catalog.db
+win:
+  icon: build/icon.ico
+  executableName: watchy
+  target:
+    - nsis
+nsis:
+  oneClick: true
+  allowToChangeInstallationDirectory: false
+  createDesktopShortcut: false
+  createStartMenuShortcut: true
+  shortcutName: Watchy
+  artifactName: ${name}-${version}-setup.${ext}
+mac:
+  entitlementsInherit: build/entitlements.mac.plist
+  notarize: false
+  target:
+    - dmg
+linux:
+  icon: build/icon.png
+  category: Network
+  artifactName: ${name}-${version}-linux.${ext}
+  target:
+    - AppImage
+appImage:
+  artifactName: ${name}-${version}-linux.${ext}
+dmg:
+  artifactName: ${name}-${version}-mac.${ext}
+npmRebuild: false
+buildDependenciesFromSource: false
+publish:
+  provider: generic
+  url: https://example.com/auto-updates
