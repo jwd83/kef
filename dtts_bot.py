@@ -1,13 +1,17 @@
 import asyncio
+import json
 import logging
 import os
 import re
+import subprocess
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
+from urllib.parse import quote, unquote
 
 import discord
+import requests
 from discord.ext import commands
 from dotenv import load_dotenv
 from pocket_tts import TTSModel
@@ -28,7 +32,11 @@ BUILTIN_VOICES = [
 VOICES_DIR = Path(__file__).resolve().parent / "voices"
 MAX_QUEUE_SIZE = 100
 MAX_MESSAGE_CHARS = 220
-
+MAGNET_DB_PATH = Path(__file__).resolve().parent / "magnets.json"
+APIBAY_URL = "https://apibay.org"
+ALLDEBRID_URL = "https://api.alldebrid.com/v4"
+ALLDEBRID_URL_V41 = "https://api.alldebrid.com/v4.1"
+VIDEO_EXTENSIONS = {".mp4", ".mkv", ".avi", ".mov", ".wmv", ".flv", ".webm", ".m4v", ".mpg", ".mpeg"}
 
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(level=LOG_LEVEL, format="%(levelname)s:%(name)s:%(message)s")
@@ -42,6 +50,183 @@ class GuildTTSState:
     voice_client: Optional[discord.VoiceClient] = None
     worker: Optional[asyncio.Task] = None
     last_speaker_by_channel: dict[int, int] = field(default_factory=dict)
+
+
+class MagnetDatabase:
+    """Simple JSON-based database for tracking magnets with m-numbers."""
+
+    def __init__(self, path: Path = MAGNET_DB_PATH) -> None:
+        self.path = path
+        self._data: dict = {"next_id": 1, "magnets": {}}
+        self._load()
+
+    def _load(self) -> None:
+        if self.path.exists():
+            try:
+                with open(self.path, "r", encoding="utf-8") as f:
+                    self._data = json.load(f)
+                logger.info("Loaded magnet database with %d entries.", len(self._data.get("magnets", {})))
+            except (json.JSONDecodeError, OSError) as e:
+                logger.warning("Failed to load magnet database: %s", e)
+                self._data = {"next_id": 1, "magnets": {}}
+
+    def _save(self) -> None:
+        try:
+            with open(self.path, "w", encoding="utf-8") as f:
+                json.dump(self._data, f, indent=2)
+        except OSError as e:
+            logger.error("Failed to save magnet database: %s", e)
+
+    def _extract_hash(self, magnet: str) -> Optional[str]:
+        """Extract info hash from magnet link."""
+        match = re.search(r"btih:([a-fA-F0-9]{40}|[a-zA-Z2-7]{32})", magnet)
+        return match.group(1).lower() if match else None
+
+    def get_or_create(self, magnet: str, name: str, seeders: int, leechers: int, size: str) -> int:
+        """Get existing m-number for magnet or create a new one."""
+        info_hash = self._extract_hash(magnet)
+        if not info_hash:
+            return -1
+
+        magnets = self._data.get("magnets", {})
+        for m_num, entry in magnets.items():
+            if entry.get("hash") == info_hash:
+                return int(m_num)
+
+        m_num = self._data["next_id"]
+        self._data["next_id"] = m_num + 1
+        self._data["magnets"][str(m_num)] = {
+            "hash": info_hash,
+            "name": name,
+            "magnet": magnet,
+            "seeders": seeders,
+            "leechers": leechers,
+            "size": size,
+            "alldebrid_id": None,
+        }
+        self._save()
+        return m_num
+
+    def get_by_m_number(self, m_num: int) -> Optional[dict]:
+        """Get magnet entry by m-number."""
+        return self._data.get("magnets", {}).get(str(m_num))
+
+    def update_alldebrid_id(self, m_num: int, ad_id: int) -> None:
+        """Store the AllDebrid magnet ID for an m-number."""
+        magnets = self._data.get("magnets", {})
+        if str(m_num) in magnets:
+            magnets[str(m_num)]["alldebrid_id"] = ad_id
+            self._save()
+
+
+class AllDebridService:
+    """Service for interacting with AllDebrid API."""
+
+    def __init__(self, api_key: str) -> None:
+        self.api_key = api_key
+        self.agent = "kef-discord-bot"
+
+    async def upload_magnet(self, magnet: str) -> dict:
+        """Upload a magnet to AllDebrid."""
+        def _request():
+            resp = requests.get(
+                f"{ALLDEBRID_URL}/magnet/upload",
+                params={"agent": self.agent, "apikey": self.api_key, "magnets": magnet},
+                timeout=30,
+            )
+            resp.raise_for_status()
+            return resp.json()
+        return await asyncio.to_thread(_request)
+
+    async def get_status(self, magnet_id: int) -> dict:
+        """Get status of a magnet by its AllDebrid ID."""
+        def _request():
+            headers = {"Authorization": f"Bearer {self.api_key}"}
+            form = {"id": str(magnet_id)}
+            resp = requests.post(
+                f"{ALLDEBRID_URL_V41}/magnet/status",
+                data=form,
+                headers=headers,
+                timeout=30,
+            )
+            resp.raise_for_status()
+            return resp.json()
+        return await asyncio.to_thread(_request)
+
+    async def get_files(self, magnet_id: int) -> dict:
+        """Get files for a magnet by its AllDebrid ID."""
+        def _request():
+            headers = {"Authorization": f"Bearer {self.api_key}"}
+            resp = requests.post(
+                f"{ALLDEBRID_URL_V41}/magnet/files",
+                data={"id[]": str(magnet_id)},
+                headers=headers,
+                timeout=30,
+            )
+            resp.raise_for_status()
+            return resp.json()
+        return await asyncio.to_thread(_request)
+
+    async def unlock_link(self, link: str) -> dict:
+        """Unlock a host link to get a direct playable URL."""
+        def _request():
+            resp = requests.get(
+                f"{ALLDEBRID_URL}/link/unlock",
+                params={"agent": self.agent, "apikey": self.api_key, "link": link},
+                timeout=30,
+            )
+            resp.raise_for_status()
+            return resp.json()
+        return await asyncio.to_thread(_request)
+
+
+class ScraperService:
+    """Service for searching API Bay."""
+
+    @staticmethod
+    def format_size(size_bytes: int) -> str:
+        if size_bytes == 0:
+            return "0 B"
+        k = 1024
+        sizes = ["B", "KB", "MB", "GB", "TB"]
+        i = int(size_bytes.bit_length() - 1) // 10
+        i = min(i, len(sizes) - 1)
+        return f"{size_bytes / (k ** i):.2f} {sizes[i]}"
+
+    async def search(self, query: str) -> list[dict]:
+        """Search API Bay for torrents."""
+        sanitized = re.sub(r"'", " ", query)
+        sanitized = re.sub(r"\s+", " ", sanitized).strip()
+        logger.info("Searching API Bay for: %s", sanitized)
+
+        def _request():
+            url = f"{APIBAY_URL}/q.php"
+            resp = requests.get(url, params={"q": sanitized, "cat": "0"}, timeout=30)
+            resp.raise_for_status()
+            return resp.json()
+
+        try:
+            results = await asyncio.to_thread(_request)
+        except requests.RequestException as e:
+            logger.error("API Bay search error: %s", e)
+            return []
+
+        if not results or (results[0].get("name") == "No results returned"):
+            return []
+
+        transformed = []
+        for item in results:
+            info_hash = item.get("info_hash", "")
+            name = item.get("name", "Unknown")
+            magnet = f"magnet:?xt=urn:btih:{info_hash}&dn={quote(name)}"
+            transformed.append({
+                "name": name,
+                "magnet": magnet,
+                "seeders": int(item.get("seeders", 0)),
+                "leechers": int(item.get("leechers", 0)),
+                "size": self.format_size(int(item.get("size", 0))),
+            })
+        return transformed
 
 
 class TTSManager:
@@ -274,6 +459,299 @@ def build_bot() -> commands.Bot:
             await ctx.send(f"Voice set to built-in '{voice_key}'.")
         else:
             await ctx.send(f"Voice set to '{voice_key}'.")
+
+    # Initialize services for search/open/play commands
+    magnet_db = MagnetDatabase()
+    scraper = ScraperService()
+    alldebrid_api_key = os.getenv("ALLDEBRID_API_KEY")
+    alldebrid = AllDebridService(alldebrid_api_key) if alldebrid_api_key else None
+
+    # Store last opened magnet files per guild for !play command
+    last_opened_files: dict[int, dict] = {}
+
+    def _parse_m_number(arg: str) -> Optional[int]:
+        """Parse an m-number from a string like 'm5' or '5'."""
+        arg = arg.strip().lower()
+        if arg.startswith("m"):
+            arg = arg[1:]
+        try:
+            return int(arg)
+        except ValueError:
+            return None
+
+    def _is_magnet(arg: str) -> bool:
+        """Check if argument is a magnet link."""
+        return arg.strip().lower().startswith("magnet:")
+
+    def _extract_video_files(files_data: list, path: str = "") -> list[dict]:
+        """Recursively extract video files from AllDebrid files structure."""
+        videos = []
+        for item in files_data:
+            if "e" in item:  # It's a folder with sub-entries
+                folder_name = item.get("n", "")
+                sub_path = f"{path}/{folder_name}" if path else folder_name
+                videos.extend(_extract_video_files(item["e"], sub_path))
+            elif "l" in item:  # It's a file with a link
+                filename = item.get("n", "")
+                ext = Path(filename).suffix.lower()
+                if ext in VIDEO_EXTENSIONS:
+                    videos.append({
+                        "name": filename,
+                        "link": item["l"],
+                        "size": item.get("s", 0),
+                        "path": f"{path}/{filename}" if path else filename,
+                    })
+        return videos
+
+    @bot.command(name="search")
+    async def search_torrents(ctx: commands.Context, *, query: str) -> None:
+        """Search API Bay for torrents. Usage: !search <query>"""
+        await ctx.send(f"Searching for: {query}...")
+
+        results = await scraper.search(query)
+        if not results:
+            await ctx.send("No results found.")
+            return
+
+        # Limit to 10 results
+        results = results[:10]
+
+        lines = ["**Search Results:**"]
+        for r in results:
+            m_num = magnet_db.get_or_create(
+                magnet=r["magnet"],
+                name=r["name"],
+                seeders=r["seeders"],
+                leechers=r["leechers"],
+                size=r["size"],
+            )
+            # Truncate long names for display
+            name = r["name"][:60] + "..." if len(r["name"]) > 60 else r["name"]
+            lines.append(f"**m{m_num}** | {name} | {r['size']} | S:{r['seeders']} L:{r['leechers']}")
+
+        # Discord has a 2000 char limit, split if needed
+        message = "\n".join(lines)
+        if len(message) > 1900:
+            for i in range(0, len(lines), 5):
+                chunk = "\n".join(lines[i:i+5])
+                await ctx.send(chunk)
+        else:
+            await ctx.send(message)
+
+    @bot.command(name="open")
+    async def open_magnet(ctx: commands.Context, *, arg: str) -> None:
+        """Open a magnet via AllDebrid. Usage: !open <m-number> or !open <magnet link>"""
+        if not alldebrid:
+            await ctx.send("AllDebrid API key not configured.")
+            return
+
+        # Determine if arg is an m-number or a magnet link
+        magnet = None
+        m_num = None
+
+        if _is_magnet(arg):
+            magnet = arg.strip()
+        else:
+            m_num = _parse_m_number(arg)
+            if m_num is None:
+                await ctx.send("Invalid argument. Use an m-number (e.g., m5) or a magnet link.")
+                return
+            entry = magnet_db.get_by_m_number(m_num)
+            if not entry:
+                await ctx.send(f"m{m_num} not found. Use !search first.")
+                return
+            magnet = entry["magnet"]
+
+        await ctx.send("Unlocking magnet via AllDebrid...")
+
+        try:
+            # Upload magnet to AllDebrid
+            upload_result = await alldebrid.upload_magnet(magnet)
+            if upload_result.get("status") != "success":
+                error = upload_result.get("error", {}).get("message", "Unknown error")
+                await ctx.send(f"Failed to upload magnet: {error}")
+                return
+
+            magnets_data = upload_result.get("data", {}).get("magnets", [])
+            if not magnets_data:
+                await ctx.send("No magnet data returned from AllDebrid.")
+                return
+
+            ad_magnet = magnets_data[0]
+            ad_id = ad_magnet.get("id")
+            ready = ad_magnet.get("ready", False)
+
+            # Update database with AllDebrid ID if we have an m-number
+            if m_num is not None:
+                magnet_db.update_alldebrid_id(m_num, ad_id)
+
+            if not ready:
+                await ctx.send(f"Magnet uploaded (ID: {ad_id}). Status: Processing... Check back later.")
+                return
+
+            # Get files
+            files_result = await alldebrid.get_files(ad_id)
+            if files_result.get("status") != "success":
+                error = files_result.get("error", {}).get("message", "Unknown error")
+                await ctx.send(f"Failed to get files: {error}")
+                return
+
+            magnets_files = files_result.get("data", {}).get("magnets", [])
+            if not magnets_files:
+                await ctx.send("No files found in magnet.")
+                return
+
+            files_data = magnets_files[0].get("files", [])
+            videos = _extract_video_files(files_data)
+
+            if not videos:
+                await ctx.send("No video files found in this magnet.")
+                return
+
+            # Store for !play command
+            guild_id = ctx.guild.id if ctx.guild else 0
+            last_opened_files[guild_id] = {
+                "ad_id": ad_id,
+                "videos": videos,
+                "m_num": m_num,
+            }
+
+            lines = [f"**Videos in magnet** (ID: {ad_id}):"]
+            for i, v in enumerate(videos, 1):
+                size_str = ScraperService.format_size(v["size"]) if v["size"] else "?"
+                name = v["name"][:50] + "..." if len(v["name"]) > 50 else v["name"]
+                lines.append(f"**{i}.** {name} ({size_str})")
+
+            message = "\n".join(lines)
+            if len(message) > 1900:
+                for i in range(0, len(lines), 10):
+                    chunk = "\n".join(lines[i:i+10])
+                    await ctx.send(chunk)
+            else:
+                await ctx.send(message)
+
+        except requests.RequestException as e:
+            logger.error("AllDebrid API error: %s", e)
+            await ctx.send(f"AllDebrid API error: {e}")
+
+    @bot.command(name="play")
+    async def play_video(ctx: commands.Context, arg: str, file_num: Optional[int] = None) -> None:
+        """Play a video from an opened magnet. Usage: !play <m-number> [file_number]"""
+        if not alldebrid:
+            await ctx.send("AllDebrid API key not configured.")
+            return
+
+        guild_id = ctx.guild.id if ctx.guild else 0
+
+        # Check if arg is an m-number or magnet
+        videos = None
+        ad_id = None
+
+        if _is_magnet(arg):
+            # Need to open the magnet first
+            await ctx.send("Opening magnet first...")
+            try:
+                upload_result = await alldebrid.upload_magnet(arg)
+                if upload_result.get("status") != "success":
+                    await ctx.send("Failed to upload magnet.")
+                    return
+
+                magnets_data = upload_result.get("data", {}).get("magnets", [])
+                if not magnets_data or not magnets_data[0].get("ready"):
+                    await ctx.send("Magnet not ready yet. Try again later.")
+                    return
+
+                ad_id = magnets_data[0]["id"]
+                files_result = await alldebrid.get_files(ad_id)
+                if files_result.get("status") != "success":
+                    await ctx.send("Failed to get files.")
+                    return
+
+                magnets_files = files_result.get("data", {}).get("magnets", [])
+                if magnets_files:
+                    files_data = magnets_files[0].get("files", [])
+                    videos = _extract_video_files(files_data)
+            except requests.RequestException as e:
+                await ctx.send(f"API error: {e}")
+                return
+        else:
+            m_num = _parse_m_number(arg)
+            if m_num is None:
+                await ctx.send("Invalid argument. Use an m-number or magnet link.")
+                return
+
+            # Check if this is the last opened magnet
+            last = last_opened_files.get(guild_id)
+            if last and last.get("m_num") == m_num:
+                videos = last["videos"]
+                ad_id = last["ad_id"]
+            else:
+                # Need to open it first
+                entry = magnet_db.get_by_m_number(m_num)
+                if not entry:
+                    await ctx.send(f"m{m_num} not found. Use !search first.")
+                    return
+
+                ad_id = entry.get("alldebrid_id")
+                if not ad_id:
+                    await ctx.send(f"m{m_num} hasn't been opened yet. Use !open m{m_num} first.")
+                    return
+
+                try:
+                    files_result = await alldebrid.get_files(ad_id)
+                    if files_result.get("status") != "success":
+                        await ctx.send("Failed to get files from AllDebrid.")
+                        return
+
+                    magnets_files = files_result.get("data", {}).get("magnets", [])
+                    if magnets_files:
+                        files_data = magnets_files[0].get("files", [])
+                        videos = _extract_video_files(files_data)
+                except requests.RequestException as e:
+                    await ctx.send(f"API error: {e}")
+                    return
+
+        if not videos:
+            await ctx.send("No video files available.")
+            return
+
+        # Default to first file
+        file_idx = (file_num or 1) - 1
+        if file_idx < 0 or file_idx >= len(videos):
+            await ctx.send(f"Invalid file number. Choose 1-{len(videos)}.")
+            return
+
+        video = videos[file_idx]
+        await ctx.send(f"Unlocking: {video['name']}...")
+
+        try:
+            unlock_result = await alldebrid.unlock_link(video["link"])
+            if unlock_result.get("status") != "success":
+                error = unlock_result.get("error", {}).get("message", "Unknown error")
+                await ctx.send(f"Failed to unlock link: {error}")
+                return
+
+            stream_url = unlock_result.get("data", {}).get("link")
+            if not stream_url:
+                await ctx.send("No stream URL returned.")
+                return
+
+            # Launch VLC
+            await ctx.send(f"Launching VLC for: {video['name']}")
+            vlc_path = r"C:\Program Files\VideoLAN\VLC\vlc.exe"
+            if not Path(vlc_path).exists():
+                vlc_path = "vlc"  # Try PATH
+
+            subprocess.Popen(
+                [vlc_path, "--fullscreen", "--no-video-title-show", stream_url],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+
+        except requests.RequestException as e:
+            await ctx.send(f"API error: {e}")
+        except FileNotFoundError:
+            await ctx.send("VLC not found. Make sure VLC is installed.")
 
     @bot.event
     async def on_message(message: discord.Message) -> None:
