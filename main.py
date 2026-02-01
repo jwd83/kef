@@ -753,9 +753,38 @@ def build_bot() -> commands.Bot:
         except FileNotFoundError:
             await ctx.send("VLC not found. Make sure VLC is installed.")
 
+    def _find_user_voice_guild(user: discord.User) -> Optional[int]:
+        """Find the guild ID where the user is in a voice channel with the bot."""
+        for guild_id, state in tts_manager._guilds.items():
+            if not state.voice_client or not state.voice_client.is_connected():
+                continue
+            voice_channel = state.voice_client.channel
+            if voice_channel and user.id in [m.id for m in voice_channel.members]:
+                return guild_id
+        return None
+
     @bot.event
     async def on_message(message: discord.Message) -> None:
-        if message.author.bot or not message.guild:
+        if message.author.bot:
+            return
+
+        # Handle DMs: read them in the voice channel the user is in
+        if not message.guild:
+            guild_id = _find_user_voice_guild(message.author)
+            if guild_id is None:
+                return
+            state = tts_manager.get_guild_state(guild_id)
+            if not state.voice_client or not state.voice_client.is_connected():
+                return
+            content = _sanitize_tts_text(message)
+            if not content:
+                return
+            if len(content) > MAX_MESSAGE_CHARS:
+                content = content[: MAX_MESSAGE_CHARS - 1] + "…"
+            # Always include user name for DMs to prevent spoofing
+            text = f"{message.author.name} says: {content}"
+            logger.debug("Queueing DM from %s in guild %s.", message.author.name, guild_id)
+            await tts_manager.enqueue(guild_id, text)
             return
 
         if message.content.startswith("!join") or message.content.startswith("!leave"):
