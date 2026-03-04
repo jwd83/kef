@@ -5,17 +5,26 @@ description = "Discord TTS bot using Pocket TTS"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
-  "discord.py>=2.4.0",
+  "discord.py[voice] @ git+https://github.com/Rapptz/discord.py.git@026a882d526f04421c05951a91ada237a05d287c",
   "pocket-tts>=0.1.0",
   "python-dotenv>=1.0.1",
-  "PyNaCl>=1.5.0",
   "scipy>=1.12.0",
   "torch>=2.5.0",
   "requests>=2.32.5",
 ]
 
 [project.scripts]
-dtts = "dtts_bot:main"
+dtts = "main:main"
+
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+py-modules = ["main"]
+
+[dependency-groups]
+dev = []
 
 [tool.uv]
-dev-dependencies = []
+package = true
